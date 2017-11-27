@@ -46,7 +46,6 @@ func runQueue(delay time.Duration) {
                  fmt.Println("Channel closed!")
                }
             default:
-               fmt.Println("Nothing in the queue, moving on.")
           }
         case <- quit:
            ticker.Stop()
@@ -151,26 +150,42 @@ func historicDataHelper(market string, start string, end string, granularity str
   }
 }
 
-func addHistoricMarketData(s *mgo.Session, market string, candles []Candle) {
+func addHistoricMarketData(s *mgo.Session, market string, candles []Candle, granNum int64) {
   session := s.Copy()
   defer session.Close()
 
-  c := session.DB("market_history").C(market)
+  // TODO: handle multiple exchanges
+  c := session.DB("gdax_market_history").C(market)
 
-  for _, candle := range candles {
-    err := c.Insert(candle)
-    if err != nil {
-      if mgo.IsDup(err) {
-        fmt.Printf("Data already exists for %s at time %d\n", market, candle.Time)
-      } else {
-        fmt.Printf("Did not insert into %s at time %d\n", market, candle.Time)
-      }
-    }
-  }
-  if (len(candles) != 0) {
-    fmt.Printf("Finished inserting data into %s upto time %d\n", market, candles[0].Time)
+  if (len(candles) == 0) {
+    fmt.Println("No data to insert\n")
   } else {
-    fmt.Printf("No data to insert")
+    lastCandle := candles[0]
+    for _, candle := range candles {
+      // TODO: not sure if this is working
+      if (int64(candle.Time) != int64(lastCandle.Time) + granNum) {
+        numMissing := ((candle.Time - lastCandle.Time) / int(granNum)) - 1
+        for i := 1; i <= numMissing; i++ {
+          time := lastCandle.Time + i * int(granNum)
+          empty := Candle{ time, lastCandle.Open, lastCandle.Close, lastCandle.Low, lastCandle.High, 0 }
+          err := c.Insert(empty)
+          if err != nil {
+            if !mgo.IsDup(err) {
+              panic(err)
+            }
+          }
+          fmt.Printf("Added empty candle for %d\n", time)
+        }
+      }
+      err := c.Insert(candle)
+      if err != nil {
+        if !mgo.IsDup(err) {
+          fmt.Printf("Did not insert into %s at time %d\n", market, candle.Time)
+        }
+      }
+      lastCandle = candle
+    }
+    fmt.Printf("Finished inserting data into %s upto time %d\n", market, candles[0].Time)
   }
 }
 
@@ -181,14 +196,19 @@ func populateDB(s *mgo.Session, market string, start int64, granNum int64, granu
     endISO := time.Unix(endUnix, 0).Format(time.RFC3339)
     fmt.Println("going from " + startISO + " to " + endISO + "\n")
     candleData := historicDataHelper(market, startISO, endISO, granularity)
-    go addHistoricMarketData(s, market, candleData)
+    go addHistoricMarketData(s, market + "-" + granularity, candleData, granNum)
     go populateDB(s, market, endUnix + granNum, granNum, granularity)
+  }
+}
+
+func getData(s *mgo.Session) func(w http.ResponseWriter, r *http.Request) {
+  return func(w http.ResponseWriter, r *http.Request) {
+
   }
 }
 
 func populateHandler(s *mgo.Session) func(w http.ResponseWriter, r *http.Request) {
   return func(w http.ResponseWriter, r *http.Request) {
-    fmt.Println("Got a request to populate some data.")
     vars := mux.Vars(r)
     market := vars["market"]
     start := vars["start"]
@@ -214,9 +234,9 @@ func ensureIndex(s *mgo.Session) {
   session := s.Copy()
   defer session.Close()
   
-  markets := [1]string{"ETH-USD"}
+  markets := [1]string{"ETH-USD-10"}
   for _, market := range markets {
-    c := session.DB("market_history").C(market)
+    c := session.DB("gdax_market_history").C(market)
 
     index := mgo.Index{
       Key:        []string{"time"},
@@ -233,6 +253,13 @@ func ensureIndex(s *mgo.Session) {
   }
 }
 
+func Log(handler http.Handler) http.Handler {
+  return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+    log.Printf("%s %s %s", r.RemoteAddr, r.Method, r.URL)
+    handler.ServeHTTP(w, r)
+  })
+}
+
  func main() {
     session, err := mgo.Dial("mongodb://mongo-0.mongo,mongo-1.mongo:27017")
     if err != nil {
@@ -245,9 +272,20 @@ func ensureIndex(s *mgo.Session) {
 
     runQueue(400)
 
+    marketRe := "[A-Z]{3}-[A-Z]{3}"
+    unixRe := "[0-9]{10}"
+    granRe := "[0-9]{2,4}"
+
     router := mux.NewRouter().StrictSlash(true)
     router.HandleFunc("/", routesList)
     router.HandleFunc("/api/current/{market}", getCurrentDataHandler).Methods("GET")
-    router.HandleFunc("/api/populate-db/{market:[A-Z]{3}-[A-Z]{3}}/{start:[0-9]{10}}/{granularity:[0-9]{2,4}}", populateHandler(session)).Methods("GET")
-    log.Fatal(http.ListenAndServe(":8086", router))
+    router.HandleFunc(
+      fmt.Sprintf("/api/populate-db/{market:%s}/{start:%s}/{granularity:%s}", marketRe, unixRe, granRe),
+      populateHandler(session),
+    ).Methods("GET")
+    router.HandleFunc(
+      fmt.Sprintf("/api/history/{market:%s}/{start:%s}/{end:%s}/{granularity:%s}", marketRe, unixRe, unixRe, granRe),
+      getData(session),
+    ).Methods("GET")
+    log.Fatal(http.ListenAndServe(":8086", Log(router)))
  }
