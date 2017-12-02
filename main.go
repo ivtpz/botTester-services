@@ -203,7 +203,7 @@ func populateDB(s *mgo.Session, market string, start int64, granNum int64, granu
 
 func getData(s *mgo.Session) func(w http.ResponseWriter, r *http.Request) {
   return func(w http.ResponseWriter, r *http.Request) {
-
+    // TODO: write this function, test empty data inserter
   }
 }
 
