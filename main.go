@@ -5,12 +5,13 @@ import (
       "log"
       "fmt"
       "time"
+      "math"
       "io/ioutil"
       "encoding/json"
       "strconv"
       "github.com/gorilla/mux"
       "gopkg.in/mgo.v2"
-      // "gopkg.in/mgo.v2/bson"
+      "gopkg.in/mgo.v2/bson"
  )
 
 func routesList(w http.ResponseWriter, r *http.Request) {
@@ -66,12 +67,12 @@ func processApiRequest(request *http.Request) (*http.Response, error) {
 }
 
 type Candle struct {
-	Time   int     `json:"time"`
-	Open   float64 `json:"open"`
-	Close  float64 `json:"close"`
-	Low    float64 `json:"low"`
-	High   float64 `json:"high"`
-	Volume float64 `json:"volume"`
+	Time   int     `json:"time" bson:"time"`
+	Open   float64 `json:"open" bson:"open"`
+	Close  float64 `json:"close" bson:"close"`
+	Low    float64 `json:"low" bson:"low"`
+	High   float64 `json:"high" bson:"high"`
+	Volume float64 `json:"volume" bson:"volume"`
 }
 
 type EmptyResponse struct {
@@ -150,7 +151,12 @@ func historicDataHelper(market string, start string, end string, granularity str
   }
 }
 
-func addHistoricMarketData(s *mgo.Session, market string, candles []Candle, granNum int64) {
+func createEmptyCandle(time int, baseCandle Candle) Candle {
+  empty := Candle{ time, baseCandle.Open, baseCandle.Close, baseCandle.Low, baseCandle.High, 0 }
+  return empty
+}
+
+func addHistoricMarketData(s *mgo.Session, market string, candles []Candle, granNum int64, start int) {
   session := s.Copy()
   defer session.Close()
 
@@ -160,14 +166,38 @@ func addHistoricMarketData(s *mgo.Session, market string, candles []Candle, gran
   if (len(candles) == 0) {
     fmt.Println("No data to insert\n")
   } else {
-    lastCandle := candles[0]
-    for _, candle := range candles {
-      // TODO: not sure if this is working
-      if (int64(candle.Time) != int64(lastCandle.Time) + granNum) {
-        numMissing := ((candle.Time - lastCandle.Time) / int(granNum)) - 1
+    var lastCandle Candle
+    // TODO: fix this code duplication
+    var startingIndex int
+    if candles[0].Time < candles[len(candles) - 1].Time {
+      startingIndex = 0
+    } else {
+      startingIndex = len(candles) - 1
+    }
+    if start != candles[startingIndex].Time {
+      numMissing := ((candles[startingIndex].Time - start) / int(granNum))
+      fmt.Printf("Missing %d from start", numMissing)
+      for i := 0; i < numMissing; i++ {
+        time := start + i * int(granNum)
+        empty := createEmptyCandle(time, candles[startingIndex])
+        err := c.Insert(empty)
+        if err != nil {
+          if !mgo.IsDup(err) {
+            panic(err)
+          }
+        }
+        fmt.Printf("Added empty candle for %d\n", time)
+      }
+    }
+    for i, candle := range candles {
+      // TODO: This really needs testing
+      difference := math.Abs(float64(candle.Time) - float64(lastCandle.Time))
+      if (i != 0 && int64(difference) != granNum) {
+        numMissing := (int(difference) / int(granNum)) - 1
+        fmt.Printf("Missing %d candles \n", numMissing)
         for i := 1; i <= numMissing; i++ {
           time := lastCandle.Time + i * int(granNum)
-          empty := Candle{ time, lastCandle.Open, lastCandle.Close, lastCandle.Low, lastCandle.High, 0 }
+          empty := createEmptyCandle(time, lastCandle)
           err := c.Insert(empty)
           if err != nil {
             if !mgo.IsDup(err) {
@@ -189,21 +219,62 @@ func addHistoricMarketData(s *mgo.Session, market string, candles []Candle, gran
   }
 }
 
-func populateDB(s *mgo.Session, market string, start int64, granNum int64, granularity string) {
+// Recursive loop to get all data from start point until current time
+func populateDBUntilNow(s *mgo.Session, market string, start int64, granNum int64, granularity string) {
   if start < time.Now().Unix() - granNum {
     endUnix := start + granNum * 199
     startISO := time.Unix(start, 0).Format(time.RFC3339)
     endISO := time.Unix(endUnix, 0).Format(time.RFC3339)
     fmt.Println("going from " + startISO + " to " + endISO + "\n")
     candleData := historicDataHelper(market, startISO, endISO, granularity)
-    go addHistoricMarketData(s, market + "-" + granularity, candleData, granNum)
-    go populateDB(s, market, endUnix + granNum, granNum, granularity)
+    go addHistoricMarketData(s, market + "-" + granularity, candleData, granNum, int(start))
+    go populateDBUntilNow(s, market, endUnix + granNum, granNum, granularity)
   }
+}
+
+// Returns api data for a given range and stores it in DB - assumes that start and end are within limit of what the api can yield
+func populateDBAndGiveResult(s *mgo.Session, market string, start int64, end int64, granNum int64, granularity string) ([]Candle) {
+  startISO := time.Unix(start, 0).Format(time.RFC3339)
+  endISO := time.Unix(end, 0).Format(time.RFC3339)
+  fmt.Println("going from " + startISO + " to " + endISO + " for market " + market + "\n")
+  candleData := historicDataHelper(market, startISO, endISO, granularity)
+  go addHistoricMarketData(s, market + "-" + granularity, candleData, granNum, int(start))
+  return candleData
 }
 
 func getData(s *mgo.Session) func(w http.ResponseWriter, r *http.Request) {
   return func(w http.ResponseWriter, r *http.Request) {
     // TODO: write this function, test empty data inserter
+    vars := mux.Vars(r)
+    // Starting point: pull from mongodb
+    session := s.Copy()
+    defer session.Close()
+
+    tableName := vars["market"] + "-" + vars["granularity"]
+    c := session.DB("gdax_market_history").C(tableName)
+
+    
+    min, _ := strconv.Atoi(vars["start"])
+    max, _ := strconv.Atoi(vars["end"])
+    stepSize, _ := strconv.Atoi(vars["granularity"])
+    
+    for i := min; i <= max; i += stepSize * 199 {
+      // TODO: handle one off errors from < vs <=
+      var dbResults []Candle
+      err := c.Find(bson.M{ "time": bson.M{ "$gt": i, "$lt": i + stepSize * 200 } }).All(&dbResults)
+      if err != nil {
+        panic(err)
+      }
+      if len(dbResults) != 199 {
+        result := populateDBAndGiveResult(s, vars["market"], int64(i + stepSize), int64(i + stepSize * 199), int64(stepSize), vars["granularity"])
+        json.NewEncoder(w).Encode(result)
+      } else {
+        json.NewEncoder(w).Encode(dbResults)
+      }
+      if f, ok := w.(http.Flusher); ok {
+        f.Flush()
+      }
+    }
   }
 }
 
@@ -223,7 +294,7 @@ func populateHandler(s *mgo.Session) func(w http.ResponseWriter, r *http.Request
     }
     currentTime := time.Now().Unix()
     sections := (currentTime - startTime) / granNum
-    go populateDB(s, market, startTime, granNum, granularity)
+    go populateDBUntilNow(s, market, startTime, granNum, granularity)
     fmt.Fprintf(w,
       "You have asked for %d sections of data, from %d to %d for market %s. This will take at least %d seconds to process.",
       sections, startTime, currentTime, market, sections / 190)
