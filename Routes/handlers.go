@@ -91,7 +91,7 @@ func (h *Handler) addHistoricMarketData(market string, candles []Mongo.Candle, g
           time := lastCandle.Time + i * int(granNum)
           empty := createEmptyCandle(time, lastCandle)
           go h.Db.AddCandle(market, empty)
-          // fmt.Printf("Added empty candle for %d\n", time)
+          fmt.Printf("Added empty candle for %d\n", time)
         }
       }
       go h.Db.AddCandle(market, candle)
