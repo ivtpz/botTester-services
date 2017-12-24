@@ -36,7 +36,8 @@ func main() {
 
     handlers := Routes.Handler{Db: ds, Queue: &queue}
 
-    marketRe := "[A-Z]{3}-[A-Z]{3}"
+    exchangeRe := "poloniex|gdax"
+    marketRe := "[A-Z]{3,4}-[A-Z]{3,4}"
     unixRe := "[0-9]{10}"
     granRe := "[0-9]{2,4}"
 
@@ -47,7 +48,7 @@ func main() {
       handlers.PopulateHandler,
     ).Methods("GET")
     router.HandleFunc(
-      fmt.Sprintf("/api/history/{market:%s}/{start:%s}/{end:%s}/{granularity:%s}", marketRe, unixRe, unixRe, granRe),
+      fmt.Sprintf("/api/history/{exchange:%s}/{market:%s}/{start:%s}/{end:%s}/{granularity:%s}", exchangeRe, marketRe, unixRe, unixRe, granRe),
       handlers.GetData,
     ).Methods("GET")
     log.Fatal(http.ListenAndServe(":8086", Routes.Log(router)))
