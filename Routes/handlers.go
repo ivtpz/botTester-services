@@ -4,7 +4,9 @@ import (
 	"fmt"
 	"log"
 	"time"
-	"math"
+  "math"
+  "regexp"
+  "strings"
 	"net/http"
 	"strconv"
 	"io/ioutil"
@@ -20,7 +22,46 @@ type Handler struct {
 	Queue *Queue.Queue
 }
 
-func (h *Handler) historicDataHelper(market string, start string, end string, granularity string) []Mongo.Candle {
+func (h *Handler) poloniexHistoricDataHelper(market string, start string, end string, granularity string) []Mongo.Candle {
+  fmt.Println("should fetch data from poloniex")
+  req, err := http.NewRequest("GET", "https://poloniex.com/public", nil)
+  if err != nil {
+    panic(err)
+  }
+  re := regexp.MustCompile("-")
+  currencyPair := re.ReplaceAllString(market, "_")
+  q := req.URL.Query()
+  q.Add("command", "returnChartData")
+  q.Add("currencyPair", currencyPair)
+  q.Add("start", start)
+  q.Add("end", end)
+  q.Add("period", granularity)
+  req.URL.RawQuery = q.Encode()
+
+  resp, err := h.Queue.ProcessRequest(req)
+
+  if err != nil {
+    panic(err)
+  }
+  defer resp.Body.Close()
+  var body []struct {
+    Date   int     `json:"date"`
+    Open   float64 `json:"open"`
+    Close  float64 `json:"close"`
+    Low    float64 `json:"low"`
+    High   float64 `json:"high"`
+    Volume float64 `json:"volume"`
+  }
+  json.NewDecoder(resp.Body).Decode(&body)
+  // body, _ := ioutil.ReadAll(resp.Body)
+  fmt.Println(body)
+
+  var test []Mongo.Candle
+  test = make([]Mongo.Candle, 0, 0)
+  return test
+}
+
+func (h *Handler) gdaxHistoricDataHelper(market string, start string, end string, granularity string) []Mongo.Candle {
   req, err := http.NewRequest("GET", "https://api.gdax.com/products/" + market + "/candles", nil)
   if err != nil {
     panic(err)
@@ -57,7 +98,7 @@ func createEmptyCandle(time int, baseCandle Mongo.Candle) Mongo.Candle {
   return empty
 }
 
-func (h *Handler) addHistoricMarketData(market string, candles []Mongo.Candle, granNum int64, start int) {
+func (h *Handler) addHistoricMarketData(dbName, market string, candles []Mongo.Candle, granNum int64, start int) {
   if (len(candles) == 0) {
     fmt.Println("No data to insert\n")
   } else {
@@ -77,7 +118,7 @@ func (h *Handler) addHistoricMarketData(market string, candles []Mongo.Candle, g
       for i := 0; i < numMissing; i++ {
         time := start + i * int(granNum)
 				empty := createEmptyCandle(time, candles[startingIndex])
-				go h.Db.AddCandle(market, empty)
+				go h.Db.AddCandle(dbName, market, empty)
         fmt.Printf("Added empty candle for %d\n", time)
       }
     }
@@ -90,11 +131,11 @@ func (h *Handler) addHistoricMarketData(market string, candles []Mongo.Candle, g
         for i := 1; i <= numMissing; i++ {
           time := lastCandle.Time + i * int(granNum)
           empty := createEmptyCandle(time, lastCandle)
-          go h.Db.AddCandle(market, empty)
+          go h.Db.AddCandle(dbName, market, empty)
           fmt.Printf("Added empty candle for %d\n", time)
         }
       }
-      go h.Db.AddCandle(market, candle)
+      go h.Db.AddCandle(dbName, market, candle)
       lastCandle = candle
     }
     fmt.Printf("Finished inserting data into %s upto time %d\n", market, candles[0].Time)
@@ -102,25 +143,34 @@ func (h *Handler) addHistoricMarketData(market string, candles []Mongo.Candle, g
 }
 
 // Recursive loop to get all data from start point until current time
+// NOTE, only works with GDAX at the moment
 func (h *Handler) populateDBUntilNow(market string, start int64, granNum int64, granularity string) {
   if start < time.Now().Unix() - granNum {
     endUnix := start + granNum * 199
     startISO := time.Unix(start, 0).Format(time.RFC3339)
     endISO := time.Unix(endUnix, 0).Format(time.RFC3339)
     fmt.Println("going from " + startISO + " to " + endISO + "\n")
-    candleData := h.historicDataHelper(market, startISO, endISO, granularity)
-    go h.addHistoricMarketData(market + "-" + granularity, candleData, granNum, int(start))
+    candleData := h.gdaxHistoricDataHelper(market, startISO, endISO, granularity)
+    go h.addHistoricMarketData("gdax_market_history", market + "-" + granularity, candleData, granNum, int(start))
     go h.populateDBUntilNow(market, endUnix + granNum, granNum, granularity)
   }
 }
 
 // Returns api data for a given range and stores it in DB - assumes that start and end are within limit of what the api can yield
-func (h *Handler) populateDBAndGiveResult(market string, start int64, end int64, granNum int64, granularity string) ([]Mongo.Candle) {
+func (h *Handler) populateDBAndGiveResult(dbName string, market string, start int64, end int64, granNum int64, granularity string) ([]Mongo.Candle) {
   startISO := time.Unix(start, 0).Format(time.RFC3339)
   endISO := time.Unix(end, 0).Format(time.RFC3339)
-  fmt.Println("going from " + startISO + " to " + endISO + " for market " + market + "\n")
-  candleData := h.historicDataHelper(market, startISO, endISO, granularity)
-  go h.addHistoricMarketData(market + "-" + granularity, candleData, granNum, int(start))
+  dbNamePieces := strings.Split(dbName, "_")
+  exchange := dbNamePieces[0]
+  fmt.Println("going from " + startISO + " to " + endISO + " for market " + market + " on exchange " + exchange + "\n")
+  var candleData []Mongo.Candle
+  switch exchange {
+  case "gdax":
+    candleData = h.gdaxHistoricDataHelper(market, startISO, endISO, granularity)
+  case "poloniex":
+    candleData = h.poloniexHistoricDataHelper(market, startISO, endISO, granularity)
+  }
+  go h.addHistoricMarketData(dbName, market + "-" + granularity, candleData, granNum, int(start))
   return candleData
 }
 
@@ -147,6 +197,7 @@ func (h *Handler) PopulateHandler(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) GetData(w http.ResponseWriter, r *http.Request) {
     vars := mux.Vars(r)
+    dbName := vars["exchange"] + "_market_history"
     tableName := vars["market"] + "-" + vars["granularity"]
     min, _ := strconv.Atoi(vars["start"])
     max, _ := strconv.Atoi(vars["end"])
@@ -159,10 +210,10 @@ func (h *Handler) GetData(w http.ResponseWriter, r *http.Request) {
 		var currentResult []Mongo.Candle
     
     for i := min; i <= max; i += stepSize * 199 {
-      currentResult = h.Db.FindCandles(tableName, i, i + stepSize * 200)
+      currentResult = h.Db.FindCandles(dbName, tableName, i, i + stepSize * 200)
       if len(currentResult) < 198 { // Should this be 199 ?
         fmt.Printf("Only have %d results\n", len(currentResult))
-        currentResult = h.populateDBAndGiveResult(vars["market"], int64(i + stepSize), int64(i + stepSize * 199), int64(stepSize), vars["granularity"])
+        currentResult = h.populateDBAndGiveResult(dbName, vars["market"], int64(i + stepSize), int64(i + stepSize * 199), int64(stepSize), vars["granularity"])
 			}
 			for _, candle := range currentResult {
 				finalResult = append(finalResult, candle)
